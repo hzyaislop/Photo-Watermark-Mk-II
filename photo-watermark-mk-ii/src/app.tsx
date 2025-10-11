@@ -5,27 +5,31 @@ declare global {
   interface Window {
     electronAPI: {
       selectFiles: () => Promise<string[]>;
+      selectDirectory: () => Promise<string[]>;
       getFileName: (path: string) => Promise<string>;
+      getThumbnail: (path: string) => Promise<string>;
+      getPathForFile: (file: File) => Promise<string>;
+      handleDroppedPaths: (paths: string[]) => Promise<string[]>;
     };
-  }
-  interface File {
-    path: string;
   }
 }
 
 interface FileInfo {
   path: string;
   name: string;
+  thumbnail: string;
 }
 
 const App = () => {
   const [fileList, setFileList] = useState<FileInfo[]>([]);
 
   const processFiles = async (files: string[]) => {
+    if (!files || files.length === 0) return;
     const fileInfoList = await Promise.all(
       files.map(async (path) => {
         const name = await window.electronAPI.getFileName(path);
-        return { path, name };
+        const thumbnail = await window.electronAPI.getThumbnail(path);
+        return { path, name, thumbnail };
       })
     );
     setFileList((prevList) => [...prevList, ...fileInfoList]);
@@ -33,16 +37,24 @@ const App = () => {
 
   const handleSelectFiles = async () => {
     const files = await window.electronAPI.selectFiles();
-    if (files) {
-      processFiles(files);
-    }
+    processFiles(files);
+  };
+
+  const handleSelectDirectory = async () => {
+    const files = await window.electronAPI.selectDirectory();
+    processFiles(files);
   };
 
   useEffect(() => {
-    const handleDrop = (event: DragEvent) => {
+    const handleDrop = async (event: DragEvent) => {
       event.preventDefault();
-      const files = Array.from(event.dataTransfer.files).map((file) => file.path);
-      processFiles(files);
+      const droppedFiles = Array.from(event.dataTransfer.files);
+      const initialPaths = await Promise.all(
+        droppedFiles.map(file => (window as any).electronAPI.getPathForFile(file))
+      );
+      const validInitialPaths = initialPaths.filter(path => !!path);
+      const allImageFiles = await window.electronAPI.handleDroppedPaths(validInitialPaths);
+      processFiles(allImageFiles);
     };
 
     const handleDragOver = (event: DragEvent) => {
@@ -62,11 +74,15 @@ const App = () => {
     <div className="app-container">
       <div className="file-list-panel">
         <h2>Files</h2>
-        <button onClick={handleSelectFiles}>Select Images</button>
+        <button onClick={handleSelectFiles}>Select Files</button>
+        <button onClick={handleSelectDirectory}>Select Folder</button>
         <p>Or drag and drop files here</p>
         <ul>
           {fileList.map((file, index) => (
-            <li key={index}>{file.name}</li>
+            <li key={index}>
+              <img src={file.thumbnail} alt={file.name} width="50" />
+              <span>{file.name}</span>
+            </li>
           ))}
         </ul>
       </div>
