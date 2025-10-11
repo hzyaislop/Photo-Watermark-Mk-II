@@ -71,6 +71,8 @@ npm run make
 
 生成的安装包会位于 `out/` 目录下。根据目标平台不同，Forge 会输出对应的安装格式（如 `.deb`、`.rpm`、`.zip` 等）。
 
+> 💡 **Sharp 原生模块说明**：项目已配置 ASAR 解包与 Forge externals 插件，确保 Windows 等平台在打包后仍能正确加载 `sharp` 及其依赖的原生二进制文件。若你新增其它原生模块，可在 `forge.config.ts` 中的 externals 配置里追加包名以获得同样的处理。
+
 ## 🗺️ 规划与后续工作
 
 - 图片水印（支持 PNG Logo 与缩放）。

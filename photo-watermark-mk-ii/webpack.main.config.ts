@@ -10,6 +10,9 @@ export const mainConfig: Configuration = {
    */
   entry: './src/index.ts',
   // Put your normal webpack config below here
+  externals: {
+    sharp: 'commonjs2 sharp',
+  },
   module: {
     rules,
   },
