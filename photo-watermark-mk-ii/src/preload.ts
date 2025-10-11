@@ -35,6 +35,19 @@ interface ExportProgressPayload {
   currentFile: string;
 }
 
+interface WatermarkTemplate {
+  id: string;
+  name: string;
+  createdAt: string;
+  options: WatermarkOptions;
+}
+
+interface ConfigState {
+  templates: WatermarkTemplate[];
+  lastUsedOptions: WatermarkOptions;
+  lastUsedTemplateId: string | null;
+}
+
 contextBridge.exposeInMainWorld('electronAPI', {
   selectFiles: () => ipcRenderer.invoke('dialog:openFiles'),
   selectDirectory: () => ipcRenderer.invoke('dialog:openDirectory'),
@@ -53,6 +66,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   handleDroppedPaths: (paths: string[]) => ipcRenderer.invoke('app:handleDroppedPaths', paths),
   applyWatermark: (filePath: string, options: WatermarkOptions): Promise<string | null> =>
     ipcRenderer.invoke('image:applyWatermark', filePath, options),
+  getConfigState: (): Promise<ConfigState> => ipcRenderer.invoke('config:getState'),
+  saveTemplate: (payload: { name: string; options: WatermarkOptions }): Promise<{
+    templates: WatermarkTemplate[];
+    templateId: string;
+  }> => ipcRenderer.invoke('config:saveTemplate', payload),
+  deleteTemplate: (templateId: string): Promise<{
+    templates: WatermarkTemplate[];
+    lastUsedTemplateId: string | null;
+  }> => ipcRenderer.invoke('config:deleteTemplate', templateId),
+  updateLastUsedOptions: (payload: { options: WatermarkOptions; templateId?: string | null }): Promise<void> =>
+    ipcRenderer.invoke('config:updateLastUsed', payload),
   runBatchExport: (payload: {
     filePaths: string[];
     watermarkOptions: WatermarkOptions;

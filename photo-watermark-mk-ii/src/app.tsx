@@ -61,6 +61,21 @@ interface ExportStatus {
   summary?: ExportSummary | null;
 }
 
+interface WatermarkTemplate {
+  id: string;
+  name: string;
+  createdAt: string;
+  options: WatermarkOptions;
+}
+
+interface ConfigState {
+  templates: WatermarkTemplate[];
+  lastUsedOptions: WatermarkOptions;
+  lastUsedTemplateId: string | null;
+}
+
+type TemplateMessage = { type: 'success' | 'error'; text: string } | null;
+
 declare global {
   interface Window {
     electronAPI: {
@@ -72,6 +87,16 @@ declare global {
       getPathForFile: (file: File) => Promise<string | null>;
       handleDroppedPaths: (paths: string[]) => Promise<string[]>;
       applyWatermark: (filePath: string, options: WatermarkOptions) => Promise<string | null>;
+      getConfigState: () => Promise<ConfigState>;
+      saveTemplate: (payload: { name: string; options: WatermarkOptions }) => Promise<{
+        templates: WatermarkTemplate[];
+        templateId: string;
+      }>;
+      deleteTemplate: (templateId: string) => Promise<{
+        templates: WatermarkTemplate[];
+        lastUsedTemplateId: string | null;
+      }>;
+      updateLastUsedOptions: (payload: { options: WatermarkOptions; templateId?: string | null }) => Promise<void>;
       runBatchExport: (payload: {
         filePaths: string[];
         watermarkOptions: WatermarkOptions;
@@ -106,6 +131,9 @@ const presetPositionMap: Record<PresetPosition, { x: number; y: number }> = {
   center: { x: 0.5, y: 0.5 },
 };
 
+const sortTemplatesByTime = (items: WatermarkTemplate[]) =>
+  [...items].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
 const App = () => {
   const [fileList, setFileList] = useState<FileInfo[]>([]);
   const [selectedImage, setSelectedImage] = useState<FileInfo | null>(null);
@@ -137,8 +165,42 @@ const App = () => {
     processed: 0,
     summary: null,
   });
+  const [templates, setTemplates] = useState<WatermarkTemplate[]>([]);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
+  const [appliedTemplateId, setAppliedTemplateId] = useState<string | null>(null);
+  const [newTemplateName, setNewTemplateName] = useState('');
+  const [templateMessage, setTemplateMessage] = useState<TemplateMessage>(null);
+  const [isConfigReady, setIsConfigReady] = useState(false);
+  const applyingTemplateRef = useRef(false);
 
   const clamp = (value: number, min = 0, max = 1) => Math.min(Math.max(value, min), max);
+
+  useEffect(() => {
+    const loadConfig = async () => {
+      try {
+        const config = await window.electronAPI.getConfigState();
+        const sortedTemplates = sortTemplatesByTime(config.templates);
+        setTemplates(sortedTemplates);
+        const hasTemplate =
+          !!config.lastUsedTemplateId && sortedTemplates.some((item) => item.id === config.lastUsedTemplateId);
+        const initialTemplateId = hasTemplate ? config.lastUsedTemplateId : sortedTemplates[0]?.id ?? null;
+        setSelectedTemplateId(initialTemplateId ?? null);
+        setAppliedTemplateId(hasTemplate ? config.lastUsedTemplateId : null);
+        applyingTemplateRef.current = true;
+        setWatermarkOptions(config.lastUsedOptions);
+      } catch (error) {
+        console.error('加载水印配置失败:', error);
+        setTemplateMessage({ type: 'error', text: '加载模板配置失败' });
+  setTemplates([]);
+  setSelectedTemplateId(null);
+  setAppliedTemplateId(null);
+      } finally {
+        setIsConfigReady(true);
+      }
+    };
+
+    loadConfig();
+  }, []);
 
   useEffect(() => {
     if (!selectedImage) {
@@ -183,6 +245,43 @@ const App = () => {
 
     apply();
   }, [selectedImage, watermarkOptions]);
+
+  useEffect(() => {
+    if (!isConfigReady) {
+      return;
+    }
+    if (applyingTemplateRef.current) {
+      applyingTemplateRef.current = false;
+      return;
+    }
+    if (appliedTemplateId) {
+      setAppliedTemplateId(null);
+    }
+  }, [watermarkOptions, appliedTemplateId, isConfigReady]);
+
+  useEffect(() => {
+    if (!isConfigReady) {
+      return;
+    }
+    const timeout = setTimeout(() => {
+      window.electronAPI.updateLastUsedOptions({
+        options: watermarkOptions,
+        templateId: appliedTemplateId,
+      });
+    }, 400);
+
+    return () => {
+      clearTimeout(timeout);
+    };
+  }, [watermarkOptions, appliedTemplateId, isConfigReady]);
+
+  useEffect(() => {
+    if (!templateMessage) {
+      return;
+    }
+    const timer = setTimeout(() => setTemplateMessage(null), 3000);
+    return () => clearTimeout(timer);
+  }, [templateMessage]);
 
   const processFiles = async (files: string[]) => {
     if (!files || files.length === 0) return;
@@ -327,6 +426,83 @@ const App = () => {
     setPreviewImage(null);
   };
 
+  const handleTemplateNameChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    setNewTemplateName(event.target.value);
+  };
+
+  const handleTemplateSelectChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+    const value = event.target.value;
+    setSelectedTemplateId(value || null);
+  };
+
+  const handleSaveTemplate = async () => {
+    const trimmed = newTemplateName.trim();
+    if (!trimmed) {
+      setTemplateMessage({ type: 'error', text: '请填写模板名称' });
+      return;
+    }
+    try {
+      const result = await window.electronAPI.saveTemplate({ name: trimmed, options: watermarkOptions });
+      const sorted = sortTemplatesByTime(result.templates);
+      setTemplates(sorted);
+      setSelectedTemplateId(result.templateId);
+      setAppliedTemplateId(result.templateId);
+      setNewTemplateName('');
+      setTemplateMessage({ type: 'success', text: '模板已保存' });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '保存模板失败';
+      setTemplateMessage({ type: 'error', text: message });
+    }
+  };
+
+  const handleLoadTemplate = () => {
+    if (!selectedTemplateId) {
+      setTemplateMessage({ type: 'error', text: '请选择要加载的模板' });
+      return;
+    }
+    const template = templates.find((item) => item.id === selectedTemplateId);
+    if (!template) {
+      setTemplateMessage({ type: 'error', text: '未找到对应模板' });
+      return;
+    }
+
+    applyingTemplateRef.current = true;
+    setWatermarkOptions(template.options);
+    setAppliedTemplateId(template.id);
+    setTemplateMessage({ type: 'success', text: `已加载模板：${template.name}` });
+  };
+
+  const handleDeleteTemplate = async () => {
+    if (!selectedTemplateId) {
+      setTemplateMessage({ type: 'error', text: '请选择要删除的模板' });
+      return;
+    }
+    try {
+      const result = await window.electronAPI.deleteTemplate(selectedTemplateId);
+      const sorted = sortTemplatesByTime(result.templates);
+      setTemplates(sorted);
+
+      const remainingTemplates = sorted;
+      const candidateId =
+        result.lastUsedTemplateId && remainingTemplates.some((item) => item.id === result.lastUsedTemplateId)
+          ? result.lastUsedTemplateId
+          : remainingTemplates[0]?.id ?? null;
+      setSelectedTemplateId(candidateId);
+      if (appliedTemplateId === selectedTemplateId) {
+        setAppliedTemplateId(
+          result.lastUsedTemplateId && remainingTemplates.some((item) => item.id === result.lastUsedTemplateId)
+            ? result.lastUsedTemplateId
+            : null,
+        );
+      }
+
+      setTemplateMessage({ type: 'success', text: '模板已删除' });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '删除模板失败';
+      setTemplateMessage({ type: 'error', text: message });
+    }
+  };
+
   const handleSelectExportDirectory = async () => {
     const directory = await window.electronAPI.selectExportDirectory();
     if (directory) {
@@ -418,6 +594,11 @@ const App = () => {
   const disableExport = isExporting || fileList.length === 0 || !exportOptions.outputDir;
   const showPrefixInput = exportOptions.namingMode === 'prefix';
   const showSuffixInput = exportOptions.namingMode === 'suffix';
+  const appliedTemplate = appliedTemplateId
+    ? templates.find((item) => item.id === appliedTemplateId) ?? null
+    : null;
+  const disableTemplateSelection = !isConfigReady || templates.length === 0;
+  const templatePlaceholder = templates.length === 0 ? '暂无模板' : '请选择模板';
   const renderWatermarkPreview = () => {
     if (!displayPreviewSrc || !watermarkText) return null;
 
@@ -526,6 +707,50 @@ const App = () => {
             <option value="custom">自定义</option>
           </select>
             <p className="controls-hint">选择“自定义”后，拖拽预览中的圆点调整位置</p>
+        </div>
+        <div className="template-section">
+          <h3>水印模板</h3>
+          <div className="template-row">
+            <input
+              type="text"
+              placeholder="输入模板名称"
+              value={newTemplateName}
+              onChange={handleTemplateNameChange}
+              disabled={!isConfigReady}
+            />
+            <button onClick={handleSaveTemplate} disabled={!isConfigReady}>
+              保存模板
+            </button>
+          </div>
+          <div className="template-row">
+            <label>模板列表:</label>
+            <select
+              value={selectedTemplateId ?? ''}
+              onChange={handleTemplateSelectChange}
+              disabled={disableTemplateSelection}
+            >
+              <option value="" disabled>
+                {templatePlaceholder}
+              </option>
+              {templates.map((template) => (
+                <option key={template.id} value={template.id} title={new Date(template.createdAt).toLocaleString()}>
+                  {template.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="template-row buttons">
+            <button onClick={handleLoadTemplate} disabled={disableTemplateSelection || !selectedTemplateId}>
+              加载模板
+            </button>
+            <button onClick={handleDeleteTemplate} disabled={disableTemplateSelection || !selectedTemplateId}>
+              删除模板
+            </button>
+          </div>
+          <p className="template-current">当前模板：{appliedTemplate ? appliedTemplate.name : '未应用模板'}</p>
+          {templateMessage && (
+            <p className={`template-message template-message-${templateMessage.type}`}>{templateMessage.text}</p>
+          )}
         </div>
         <div className="export-section">
           <h3>批量导出</h3>
