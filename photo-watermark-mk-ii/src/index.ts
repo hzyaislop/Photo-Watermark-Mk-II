@@ -89,6 +89,115 @@ async function handleDroppedPaths(paths: string[]): Promise<string[]> {
   return allImageFiles;
 }
 
+type PresetPosition =
+  | 'north'
+  | 'northeast'
+  | 'east'
+  | 'southeast'
+  | 'south'
+  | 'southwest'
+  | 'west'
+  | 'northwest'
+  | 'center';
+
+interface WatermarkOptions {
+  text: string;
+  size: number;
+  color: string;
+  opacity: number; // 0 - 100
+  mode: 'preset' | 'custom';
+  position?: PresetPosition;
+  offsetX?: number; // 0 - 1
+  offsetY?: number; // 0 - 1
+}
+
+async function applyWatermark(filePath: string, options: WatermarkOptions): Promise<string> {
+  try {
+    const { text, size, color, position = 'center', opacity, mode = 'preset', offsetX, offsetY } = options;
+
+    const image = sharp(filePath);
+    const metadata = await image.metadata();
+    const width = metadata.width ?? 1000;
+    const height = metadata.height ?? 1000;
+    const marginX = Math.max(width * 0.05, size);
+    const marginY = Math.max(height * 0.05, size);
+    const opacityValue = Math.min(Math.max(opacity ?? 100, 0), 100) / 100;
+
+    const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+
+    const escapeText = (value: string) =>
+      value.replace(/[&<>"']+/g, (match) => {
+        const map: Record<string, string> = {
+          '&': '&amp;',
+          '<': '&lt;',
+          '>': '&gt;',
+          '"': '&quot;',
+          "'": '&apos;',
+        };
+        return map[match];
+      });
+
+    const getPositionAttributes = () => {
+      switch (position) {
+        case 'north':
+          return { x: width / 2, y: marginY, anchor: 'middle', baseline: 'hanging' };
+        case 'northeast':
+          return { x: width - marginX, y: marginY, anchor: 'end', baseline: 'hanging' };
+        case 'east':
+          return { x: width - marginX, y: height / 2, anchor: 'end', baseline: 'middle' };
+        case 'southeast':
+          return { x: width - marginX, y: height - marginY, anchor: 'end', baseline: 'text-after-edge' };
+        case 'south':
+          return { x: width / 2, y: height - marginY, anchor: 'middle', baseline: 'text-after-edge' };
+        case 'southwest':
+          return { x: marginX, y: height - marginY, anchor: 'start', baseline: 'text-after-edge' };
+        case 'west':
+          return { x: marginX, y: height / 2, anchor: 'start', baseline: 'middle' };
+        case 'northwest':
+          return { x: marginX, y: marginY, anchor: 'start', baseline: 'hanging' };
+        case 'center':
+        default:
+          return { x: width / 2, y: height / 2, anchor: 'middle', baseline: 'middle' };
+      }
+    };
+
+    const useCustomPosition = mode === 'custom' && typeof offsetX === 'number' && typeof offsetY === 'number';
+
+    const { x, y, anchor, baseline } = useCustomPosition
+      ? {
+          x: clamp(offsetX, 0, 1) * width,
+          y: clamp(offsetY, 0, 1) * height,
+          anchor: 'middle',
+          baseline: 'middle',
+        }
+      : getPositionAttributes();
+
+    const svgText = `
+      <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+        <style>
+          .title { fill: ${color}; font-size: ${size}px; font-family: Arial, sans-serif; fill-opacity: ${opacityValue}; }
+        </style>
+        <text x="${x}" y="${y}" text-anchor="${anchor}" dominant-baseline="${baseline}" class="title">${escapeText(text)}</text>
+      </svg>
+    `;
+
+    const svgBuffer = Buffer.from(svgText);
+
+    const watermarkedBuffer = await image
+      .composite([
+        {
+          input: svgBuffer,
+        },
+      ])
+      .toBuffer();
+
+    return `data:image/png;base64,${watermarkedBuffer.toString('base64')}`;
+  } catch (error) {
+    console.error('Failed to apply watermark:', error);
+    return null;
+  }
+}
+
 const createWindow = (): void => {
   // Create the browser window.
   const mainWindow = new BrowserWindow({
@@ -118,6 +227,7 @@ app.whenReady().then(() => {
   ipcMain.handle('image:getThumbnail', (event, filePath) => {
     return getThumbnail(filePath);
   });
+  ipcMain.handle('image:applyWatermark', (event, filePath, options) => applyWatermark(filePath, options));
   ipcMain.handle('app:handleDroppedPaths', (event, paths) => handleDroppedPaths(paths));
   createWindow();
 });
