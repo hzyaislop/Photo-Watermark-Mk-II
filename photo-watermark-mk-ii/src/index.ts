@@ -9,6 +9,38 @@ declare const MAIN_WINDOW_WEBPACK_ENTRY: string;
 declare const MAIN_WINDOW_PRELOAD_WEBPACK_ENTRY: string;
 
 const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'bmp', 'tiff'];
+type ExportFormat = 'source' | 'png' | 'jpeg';
+
+interface BatchExportOptions {
+  outputDir: string;
+  namingMode: 'original' | 'prefix' | 'suffix';
+  prefix?: string;
+  suffix?: string;
+  format: ExportFormat;
+}
+
+interface BatchExportPayload {
+  filePaths: string[];
+  watermarkOptions: WatermarkOptions;
+  exportOptions: BatchExportOptions;
+}
+
+interface BatchExportFailure {
+  file: string;
+  reason: string;
+}
+
+interface BatchExportSummary {
+  successCount: number;
+  failureCount: number;
+  failures: BatchExportFailure[];
+}
+
+interface ExportProgressPayload {
+  processed: number;
+  total: number;
+  currentFile: string;
+}
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (require('electron-squirrel-startup')) {
@@ -111,7 +143,77 @@ interface WatermarkOptions {
   offsetY?: number; // 0 - 1
 }
 
-async function applyWatermark(filePath: string, options: WatermarkOptions): Promise<string> {
+const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+
+const escapeText = (value: string) =>
+  value.replace(/[&<>"']+/g, (match) => {
+    const map: Record<string, string> = {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&apos;',
+    };
+    return map[match];
+  });
+
+const RESERVED_FILENAME_CHARACTERS = new Set(['<', '>', ':', '"', '/', '\\', '|', '?', '*']);
+
+const sanitizeFileName = (value: string) =>
+  value
+    .split('')
+    .map((char) => {
+      if (RESERVED_FILENAME_CHARACTERS.has(char) || char.charCodeAt(0) < 32) {
+        return '_';
+      }
+      return char;
+    })
+    .join('');
+
+const resolveFormat = (requested: ExportFormat | undefined, sourceExtension: string): 'jpeg' | 'png' => {
+  if (requested && requested !== 'source') {
+    return requested;
+  }
+  const normalized = sourceExtension.toLowerCase();
+  if (normalized === 'jpg' || normalized === 'jpeg') {
+    return 'jpeg';
+  }
+  return 'png';
+};
+
+const ensureUniqueFilePath = async (dir: string, fileName: string): Promise<string> => {
+  let candidate = fileName;
+  const ext = path.extname(fileName);
+  const baseName = path.basename(fileName, ext);
+  let counter = 1;
+  while (fs.existsSync(path.join(dir, candidate))) {
+    candidate = `${baseName}(${counter})${ext}`;
+    counter += 1;
+  }
+  return path.join(dir, candidate);
+};
+
+const buildOutputFileName = (filePath: string, options: BatchExportOptions, format: 'jpeg' | 'png'): string => {
+  const originalExt = path.extname(filePath);
+  const baseName = path.basename(filePath, originalExt);
+  let composed = baseName;
+
+  if (options.namingMode === 'prefix') {
+    composed = `${options.prefix ?? ''}${composed}`;
+  } else if (options.namingMode === 'suffix') {
+    composed = `${composed}${options.suffix ?? ''}`;
+  }
+
+  const sanitized = sanitizeFileName(composed);
+  const extension = format === 'jpeg' ? '.jpg' : '.png';
+  return `${sanitized}${extension}`;
+};
+
+async function generateWatermarkedBuffer(
+  filePath: string,
+  options: WatermarkOptions,
+  formatPreference: ExportFormat,
+): Promise<{ buffer: Buffer; format: 'jpeg' | 'png' } | null> {
   try {
     const { text, size, color, position = 'center', opacity, mode = 'preset', offsetX, offsetY } = options;
 
@@ -123,21 +225,9 @@ async function applyWatermark(filePath: string, options: WatermarkOptions): Prom
     const marginY = Math.max(height * 0.05, size);
     const opacityValue = Math.min(Math.max(opacity ?? 100, 0), 100) / 100;
 
-    const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+    const useCustomPosition = mode === 'custom' && typeof offsetX === 'number' && typeof offsetY === 'number';
 
-    const escapeText = (value: string) =>
-      value.replace(/[&<>"']+/g, (match) => {
-        const map: Record<string, string> = {
-          '&': '&amp;',
-          '<': '&lt;',
-          '>': '&gt;',
-          '"': '&quot;',
-          "'": '&apos;',
-        };
-        return map[match];
-      });
-
-    const getPositionAttributes = () => {
+    const getPositionAttributes = (): { x: number; y: number; anchor: string; baseline: string } => {
       switch (position) {
         case 'north':
           return { x: width / 2, y: marginY, anchor: 'middle', baseline: 'hanging' };
@@ -161,8 +251,6 @@ async function applyWatermark(filePath: string, options: WatermarkOptions): Prom
       }
     };
 
-    const useCustomPosition = mode === 'custom' && typeof offsetX === 'number' && typeof offsetY === 'number';
-
     const { x, y, anchor, baseline } = useCustomPosition
       ? {
           x: clamp(offsetX, 0, 1) * width,
@@ -182,6 +270,7 @@ async function applyWatermark(filePath: string, options: WatermarkOptions): Prom
     `;
 
     const svgBuffer = Buffer.from(svgText);
+    const finalFormat = resolveFormat(formatPreference, path.extname(filePath).slice(1));
 
     const watermarkedBuffer = await image
       .composite([
@@ -189,13 +278,89 @@ async function applyWatermark(filePath: string, options: WatermarkOptions): Prom
           input: svgBuffer,
         },
       ])
+      .toFormat(finalFormat)
       .toBuffer();
 
-    return `data:image/png;base64,${watermarkedBuffer.toString('base64')}`;
+    return { buffer: watermarkedBuffer, format: finalFormat };
+  } catch (error) {
+    console.error('Failed to generate watermarked buffer:', error);
+    return null;
+  }
+}
+
+async function applyWatermark(filePath: string, options: WatermarkOptions): Promise<string> {
+  try {
+    const result = await generateWatermarkedBuffer(filePath, options, 'png');
+    if (!result) {
+      return null;
+    }
+    return `data:image/${result.format};base64,${result.buffer.toString('base64')}`;
   } catch (error) {
     console.error('Failed to apply watermark:', error);
     return null;
   }
+}
+
+async function handleBatchExport(
+  event: Electron.IpcMainInvokeEvent,
+  payload: BatchExportPayload,
+): Promise<BatchExportSummary> {
+  const { filePaths, watermarkOptions, exportOptions } = payload;
+  if (!Array.isArray(filePaths) || filePaths.length === 0) {
+    throw new Error('没有可导出的文件');
+  }
+
+  const normalizedOutputDir = path.resolve(exportOptions.outputDir ?? '');
+  if (!normalizedOutputDir) {
+    throw new Error('请选择导出文件夹');
+  }
+
+  const hasSameDirectory = filePaths.some(
+    (filePath) => path.resolve(path.dirname(filePath)) === normalizedOutputDir,
+  );
+
+  if (hasSameDirectory) {
+    throw new Error('默认禁止导出到原文件夹，请选择其他目录。');
+  }
+
+  await fs.promises.mkdir(normalizedOutputDir, { recursive: true });
+
+  const failures: BatchExportFailure[] = [];
+  let successCount = 0;
+  const total = filePaths.length;
+  let processed = 0;
+
+  for (const filePath of filePaths) {
+    const baseName = path.basename(filePath);
+    try {
+      const generated = await generateWatermarkedBuffer(filePath, watermarkOptions, exportOptions.format);
+      if (!generated) {
+        throw new Error('水印生成失败');
+      }
+
+      const targetName = buildOutputFileName(filePath, exportOptions, generated.format);
+      const outputPath = await ensureUniqueFilePath(normalizedOutputDir, targetName);
+      await fs.promises.writeFile(outputPath, generated.buffer);
+      successCount += 1;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : '未知错误';
+      failures.push({ file: baseName, reason });
+    } finally {
+      processed += 1;
+      const progressPayload: ExportProgressPayload = {
+        processed,
+        total,
+        currentFile: baseName,
+      };
+      event.sender.send('export:progress', progressPayload);
+    }
+  }
+
+  return {
+    successCount,
+    failureCount: failures.length,
+    failures,
+  };
 }
 
 const createWindow = (): void => {
@@ -221,6 +386,15 @@ const createWindow = (): void => {
 app.whenReady().then(() => {
   ipcMain.handle('dialog:openFiles', handleFileOpen);
   ipcMain.handle('dialog:openDirectory', handleDirectoryOpen);
+  ipcMain.handle('dialog:selectExportDirectory', async () => {
+    const { canceled, filePaths } = await dialog.showOpenDialog({
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (canceled || filePaths.length === 0) {
+      return null;
+    }
+    return filePaths[0];
+  });
   ipcMain.handle('path:basename', (event, filePath) => {
     return path.basename(filePath);
   });
@@ -229,6 +403,7 @@ app.whenReady().then(() => {
   });
   ipcMain.handle('image:applyWatermark', (event, filePath, options) => applyWatermark(filePath, options));
   ipcMain.handle('app:handleDroppedPaths', (event, paths) => handleDroppedPaths(paths));
+  ipcMain.handle('export:runBatch', (event, payload: BatchExportPayload) => handleBatchExport(event, payload));
   createWindow();
 });
 

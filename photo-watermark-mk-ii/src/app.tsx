@@ -1,26 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import './index.css';
 
-declare global {
-  interface Window {
-    electronAPI: {
-      selectFiles: () => Promise<string[]>;
-      selectDirectory: () => Promise<string[]>;
-      getFileName: (path: string) => Promise<string>;
-      getThumbnail: (path: string) => Promise<string>;
-      getPathForFile: (file: File) => Promise<string | null>;
-      handleDroppedPaths: (paths: string[]) => Promise<string[]>;
-      applyWatermark: (filePath: string, options: WatermarkOptions) => Promise<string | null>;
-    };
-  }
-}
-
-interface FileInfo {
-  path: string;
-  name: string;
-  thumbnail: string;
-}
-
 type PresetPosition =
   | 'north'
   | 'northeast'
@@ -41,6 +21,77 @@ interface WatermarkOptions {
   position: PresetPosition;
   offsetX?: number;
   offsetY?: number;
+}
+
+type ExportFormat = 'source' | 'png' | 'jpeg';
+type ExportNamingMode = 'original' | 'prefix' | 'suffix';
+
+interface ExportOptions {
+  outputDir: string;
+  namingMode: ExportNamingMode;
+  prefix: string;
+  suffix: string;
+  format: ExportFormat;
+}
+
+interface ExportProgressPayload {
+  processed: number;
+  total: number;
+  currentFile: string;
+}
+
+interface ExportFailure {
+  file: string;
+  reason: string;
+}
+
+interface ExportSummary {
+  successCount: number;
+  failureCount: number;
+  failures: ExportFailure[];
+}
+
+type ExportState = 'idle' | 'running' | 'completed' | 'error';
+
+interface ExportStatus {
+  state: ExportState;
+  total: number;
+  processed: number;
+  message?: string;
+  summary?: ExportSummary | null;
+}
+
+declare global {
+  interface Window {
+    electronAPI: {
+      selectFiles: () => Promise<string[]>;
+      selectDirectory: () => Promise<string[]>;
+      selectExportDirectory: () => Promise<string | null>;
+      getFileName: (path: string) => Promise<string>;
+      getThumbnail: (path: string) => Promise<string>;
+      getPathForFile: (file: File) => Promise<string | null>;
+      handleDroppedPaths: (paths: string[]) => Promise<string[]>;
+      applyWatermark: (filePath: string, options: WatermarkOptions) => Promise<string | null>;
+      runBatchExport: (payload: {
+        filePaths: string[];
+        watermarkOptions: WatermarkOptions;
+        exportOptions: {
+          outputDir: string;
+          namingMode: ExportNamingMode;
+          prefix?: string;
+          suffix?: string;
+          format: ExportFormat;
+        };
+      }) => Promise<ExportSummary>;
+      onExportProgress: (callback: (payload: ExportProgressPayload) => void) => () => void;
+    };
+  }
+}
+
+interface FileInfo {
+  path: string;
+  name: string;
+  thumbnail: string;
 }
 
 const presetPositionMap: Record<PresetPosition, { x: number; y: number }> = {
@@ -73,6 +124,19 @@ const App = () => {
   const latestCustomPosition = useRef<{ x: number; y: number }>({ x: 0.5, y: 0.5 });
   const [overlayPosition, setOverlayPosition] = useState<{ x: number; y: number }>({ x: 0.5, y: 0.5 });
   const [isDragging, setIsDragging] = useState(false);
+  const [exportOptions, setExportOptions] = useState<ExportOptions>({
+    outputDir: '',
+    namingMode: 'prefix',
+    prefix: 'wm_',
+    suffix: '_watermarked',
+    format: 'source',
+  });
+  const [exportStatus, setExportStatus] = useState<ExportStatus>({
+    state: 'idle',
+    total: 0,
+    processed: 0,
+    summary: null,
+  });
 
   const clamp = (value: number, min = 0, max = 1) => Math.min(Math.max(value, min), max);
 
@@ -167,6 +231,28 @@ const App = () => {
     };
   }, []);
 
+  useEffect(() => {
+    const unsubscribe = window.electronAPI.onExportProgress((payload) => {
+      setExportStatus((prev) => {
+        if (prev.state !== 'running') {
+          return prev;
+        }
+        return {
+          ...prev,
+          total: payload.total,
+          processed: payload.processed,
+          message: `正在导出 ${payload.processed} / ${payload.total}`,
+        };
+      });
+    });
+
+    return () => {
+      if (unsubscribe) {
+        unsubscribe();
+      }
+    };
+  }, []);
+
   const updatePositionFromPointer = (clientX: number, clientY: number) => {
     if (!previewRef.current) return;
     const rect = previewRef.current.getBoundingClientRect();
@@ -241,9 +327,97 @@ const App = () => {
     setPreviewImage(null);
   };
 
+  const handleSelectExportDirectory = async () => {
+    const directory = await window.electronAPI.selectExportDirectory();
+    if (directory) {
+      setExportOptions((prev) => ({ ...prev, outputDir: directory }));
+    }
+  };
+
+  const handleNamingModeChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+    const value = event.target.value as ExportNamingMode;
+    setExportOptions((prev) => ({ ...prev, namingMode: value }));
+  };
+
+  const handleFormatChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+    const value = event.target.value as ExportFormat;
+    setExportOptions((prev) => ({ ...prev, format: value }));
+  };
+
+  const handleExportTextChange = (key: 'prefix' | 'suffix') => (event: React.ChangeEvent<HTMLInputElement>) => {
+    const value = event.target.value;
+    setExportOptions((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const handleStartExport = async () => {
+    if (fileList.length === 0) {
+      setExportStatus({
+        state: 'error',
+        total: 0,
+        processed: 0,
+        message: '请先添加需要处理的文件',
+        summary: null,
+      });
+      return;
+    }
+
+    if (!exportOptions.outputDir) {
+      setExportStatus((prev) => ({
+        ...prev,
+        state: 'error',
+        total: fileList.length,
+        processed: 0,
+        message: '请选择导出文件夹',
+        summary: null,
+      }));
+      return;
+    }
+
+    const exportPayload = {
+      filePaths: fileList.map((file) => file.path),
+      watermarkOptions,
+      exportOptions: {
+        ...exportOptions,
+        prefix: exportOptions.prefix.trim(),
+        suffix: exportOptions.suffix.trim(),
+      },
+    };
+
+    setExportStatus({
+      state: 'running',
+      total: exportPayload.filePaths.length,
+      processed: 0,
+      message: `正在导出 0 / ${exportPayload.filePaths.length}`,
+      summary: null,
+    });
+
+    try {
+      const result = await window.electronAPI.runBatchExport(exportPayload);
+      setExportStatus({
+        state: 'completed',
+        total: exportPayload.filePaths.length,
+        processed: exportPayload.filePaths.length,
+        message: `导出完成：成功 ${result.successCount} 个，失败 ${result.failureCount} 个`,
+        summary: result,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '导出过程中出现错误';
+      setExportStatus((prev) => ({
+        ...prev,
+        state: 'error',
+        message,
+        summary: null,
+      }));
+    }
+  };
+
   const displayPreviewSrc = previewImage && previewImage.startsWith('data:') ? previewImage : null;
   const positionSelectValue = watermarkOptions.mode === 'custom' ? 'custom' : watermarkOptions.position;
   const watermarkText = watermarkOptions.text.trim();
+  const isExporting = exportStatus.state === 'running';
+  const disableExport = isExporting || fileList.length === 0 || !exportOptions.outputDir;
+  const showPrefixInput = exportOptions.namingMode === 'prefix';
+  const showSuffixInput = exportOptions.namingMode === 'suffix';
   const renderWatermarkPreview = () => {
     if (!displayPreviewSrc || !watermarkText) return null;
 
@@ -352,6 +526,78 @@ const App = () => {
             <option value="custom">自定义</option>
           </select>
             <p className="controls-hint">选择“自定义”后，拖拽预览中的圆点调整位置</p>
+        </div>
+        <div className="export-section">
+          <h3>批量导出</h3>
+          <div className="export-row">
+            <button onClick={handleSelectExportDirectory} disabled={isExporting}>
+              选择导出目录
+            </button>
+            <span className="export-path" title={exportOptions.outputDir}>
+              {exportOptions.outputDir || '未选择'}
+            </span>
+          </div>
+          <div className="export-row">
+            <label>命名规则:</label>
+            <select value={exportOptions.namingMode} onChange={handleNamingModeChange} disabled={isExporting}>
+              <option value="original">保持原名</option>
+              <option value="prefix">添加前缀</option>
+              <option value="suffix">添加后缀</option>
+            </select>
+          </div>
+          {showPrefixInput && (
+            <div className="export-row">
+              <label>前缀:</label>
+              <input
+                type="text"
+                value={exportOptions.prefix}
+                onChange={handleExportTextChange('prefix')}
+                disabled={isExporting}
+              />
+            </div>
+          )}
+          {showSuffixInput && (
+            <div className="export-row">
+              <label>后缀:</label>
+              <input
+                type="text"
+                value={exportOptions.suffix}
+                onChange={handleExportTextChange('suffix')}
+                disabled={isExporting}
+              />
+            </div>
+          )}
+          <div className="export-row">
+            <label>输出格式:</label>
+            <select value={exportOptions.format} onChange={handleFormatChange} disabled={isExporting}>
+              <option value="source">原始格式</option>
+              <option value="png">PNG</option>
+              <option value="jpeg">JPEG</option>
+            </select>
+          </div>
+          {isExporting && exportStatus.total > 0 && (
+            <progress className="export-progress" max={exportStatus.total} value={exportStatus.processed} />
+          )}
+          <button className="export-button" onClick={handleStartExport} disabled={disableExport}>
+            {isExporting ? '导出中…' : '开始导出'}
+          </button>
+          {exportStatus.message && (
+            <p className={`export-status export-status-${exportStatus.state}`}>
+              {exportStatus.message}
+            </p>
+          )}
+          {exportStatus.summary && exportStatus.summary.failures.length > 0 && (
+            <div className="export-failures">
+              <p>以下文件导出失败：</p>
+              <ul>
+                {exportStatus.summary.failures.map((failure, index) => (
+                  <li key={index}>
+                    <strong>{failure.file}</strong>: {failure.reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       </div>
     </div>
